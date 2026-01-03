@@ -1,135 +1,139 @@
-import express from "express";
 import http from "http";
+import express from "express";
 import { WebSocketServer } from "ws";
-import cors from "cors";
 
-const PORT = process.env.PORT || 8787;
-const PATH = process.env.WS_PATH || "/ws";
-
-// Very simple matchmaking queues by plan (elite > plus > free)
-const queues = {
-  elite: [],
-  plus: [],
-  free: []
-};
-
-const peers = new Map(); // id -> ws
-const peerState = new Map(); // id -> { peerId, plan }
-
-function makeId(){
-  return Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
-}
-
-function popNext(){
-  // priority: elite, plus, free
-  for (const plan of ["elite","plus","free"]) {
-    if (queues[plan].length) return queues[plan].shift();
-  }
-  return null;
-}
-
-function enqueue(id, plan){
-  const p = (plan === "elite" || plan === "plus") ? plan : "free";
-  // Avoid duplicates
-  for (const k of Object.keys(queues)) queues[k] = queues[k].filter(x => x !== id);
-  queues[p].push(id);
-}
-
-function removeFromQueues(id){
-  for (const k of Object.keys(queues)) queues[k] = queues[k].filter(x => x !== id);
-}
-
-function send(ws, obj){
-  try { ws.send(JSON.stringify(obj)); } catch(e){}
-}
-
-function match(){
-  // Take two users, with slight preference to keep higher plan priority
-  const a = popNext();
-  const b = popNext();
-  if (!a || !b) {
-    if (a) enqueue(a, peerState.get(a)?.plan || "free");
-    return;
-  }
-  const wsA = peers.get(a);
-  const wsB = peers.get(b);
-  if (!wsA || !wsB) return;
-
-  peerState.set(a, { ...(peerState.get(a)||{}), peerId: b });
-  peerState.set(b, { ...(peerState.get(b)||{}), peerId: a });
-
-  // Decide initiator randomly
-  const initiatorA = Math.random() > 0.5;
-
-  send(wsA, { type:"match", peerId: b, initiator: initiatorA });
-  send(wsB, { type:"match", peerId: a, initiator: !initiatorA });
-}
+const PORT = process.env.PORT || 10000;
+const WS_PATH = process.env.WS_PATH || "/ws";
 
 const app = express();
-app.use(cors());
-app.get("/health", (_req, res) => res.json({ ok:true }));
+app.get("/", (_req, res) => res.status(200).send("OMINGLE match server OK"));
+app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: PATH });
+
+const wss = new WebSocketServer({ server, path: WS_PATH });
+
+/**
+ * Simple Omegle-like pairing:
+ * - waiting: holds one socket waiting for a partner
+ * - peerMap: maps socket -> partner socket
+ */
+let waiting = null;
+const peerMap = new Map();
+
+function safeSend(ws, obj) {
+  try {
+    if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+  } catch (_) {}
+}
+
+function setPair(a, b) {
+  peerMap.set(a, b);
+  peerMap.set(b, a);
+
+  // optional event (client can show "matched")
+  safeSend(a, { type: "matched" });
+  safeSend(b, { type: "matched" });
+}
+
+function getPeer(ws) {
+  return peerMap.get(ws) || null;
+}
+
+function clearPair(ws, reason = "partner_left") {
+  const peer = getPeer(ws);
+  if (peer) {
+    peerMap.delete(peer);
+    safeSend(peer, { type: "reset", reason });
+  }
+  peerMap.delete(ws);
+}
+
+function tryPutInWaiting(ws) {
+  // if someone is waiting, pair immediately
+  if (waiting && waiting !== ws && waiting.readyState === waiting.OPEN) {
+    const other = waiting;
+    waiting = null;
+    setPair(ws, other);
+    return true;
+  }
+  // else set as waiting
+  waiting = ws;
+  safeSend(ws, { type: "waiting" });
+  return false;
+}
 
 wss.on("connection", (ws) => {
-  const id = makeId();
-  peers.set(id, ws);
-  peerState.set(id, { peerId: null, plan: "free" });
-  send(ws, { type:"hello", id });
+  // When a client connects, put them in waiting pool
+  tryPutInWaiting(ws);
 
-  ws.on("message", (raw) => {
+  ws.on("message", (buf) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); } catch(e){ return; }
-
-    if (msg.type === "queue") {
-      const plan = msg.plan || "free";
-      peerState.set(id, { ...peerState.get(id), plan, peerId: null });
-      enqueue(id, plan);
-      // Try match whenever someone queues
-      match();
-      match();
+    try {
+      msg = JSON.parse(buf.toString());
+    } catch {
+      return;
     }
 
-    if (msg.type === "leave") {
-      const st = peerState.get(id);
-      const peerId = st?.peerId;
-      if (peerId) {
-        const peerWs = peers.get(peerId);
-        if (peerWs) send(peerWs, { type:"peer-left" });
-        peerState.set(peerId, { ...peerState.get(peerId), peerId: null });
+    const peer = getPeer(ws);
+
+    // If not paired yet, we only accept "offer" and use it to pair if needed.
+    // But we STILL need to forward it once paired.
+    if (!peer) {
+      if (msg.type === "offer") {
+        // If the sender is still waiting, try to pair now (race condition safe)
+        // If pairing happens, forward offer to peer.
+        const pairedNow = tryPutInWaiting(ws);
+        const newPeer = getPeer(ws);
+
+        if (pairedNow && newPeer) {
+          safeSend(newPeer, { type: "offer", offer: msg.offer });
+        }
       }
-      peerState.set(id, { ...peerState.get(id), peerId: null });
-      removeFromQueues(id);
+      return;
     }
 
-    if (msg.type === "signal") {
-      const to = msg.to;
-      const peerWs = peers.get(to);
-      if (peerWs) send(peerWs, { type:"signal", from:id, data: msg.data });
+    // If paired, relay signaling messages ONLY to partner
+    if (msg.type === "offer") {
+      safeSend(peer, { type: "offer", offer: msg.offer });
+      return;
     }
-
-    if (msg.type === "chat") {
-      const to = msg.to;
-      const peerWs = peers.get(to);
-      if (peerWs) send(peerWs, { type:"chat", from:id, text: String(msg.text||"") });
+    if (msg.type === "answer") {
+      safeSend(peer, { type: "answer", answer: msg.answer });
+      return;
+    }
+    if (msg.type === "ice") {
+      safeSend(peer, { type: "ice", candidate: msg.candidate });
+      return;
+    }
+    if (msg.type === "skip") {
+      // both reset; re-queue both
+      safeSend(peer, { type: "reset", reason: "skip" });
+      clearPair(ws, "skip");
+      if (waiting === ws) waiting = null;
+      if (waiting === peer) waiting = null;
+      tryPutInWaiting(ws);
+      tryPutInWaiting(peer);
+      return;
     }
   });
 
   ws.on("close", () => {
-    const st = peerState.get(id);
-    const peerId = st?.peerId;
-    if (peerId) {
-      const peerWs = peers.get(peerId);
-      if (peerWs) send(peerWs, { type:"peer-left" });
-      peerState.set(peerId, { ...peerState.get(peerId), peerId: null });
-    }
-    removeFromQueues(id);
-    peers.delete(id);
-    peerState.delete(id);
+    // If this ws was waiting, clear waiting slot
+    if (waiting === ws) waiting = null;
+
+    // Break pair and notify partner
+    clearPair(ws, "disconnect");
+  });
+
+  ws.on("error", () => {
+    // treat like close
+    if (waiting === ws) waiting = null;
+    clearPair(ws, "error");
   });
 });
 
 server.listen(PORT, () => {
-  console.log(`OMINGLE signaling server listening on http://0.0.0.0:${PORT}${PATH}`);
+  console.log(`OMINGLE match server listening on :${PORT}`);
+  console.log(`WebSocket path: ${WS_PATH}`);
 });
