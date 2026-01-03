@@ -1,35 +1,23 @@
 /**
- * OMINGLE Match + Signaling Server (MVP)
- * - WebSocket path: /ws
- * - Deterministic roles: caller/callee (only caller creates offer)
- * - Relays: offer/answer/ice/chat
- * - Skip / Stop (reset) handling
- * - Robust cleanup on disconnect
+ * OMINGLE Match + Signaling Server (MVP) - ESM
+ * WebSocket path: /ws
+ * Deterministic roles: caller/callee (only caller creates offer)
+ * Relays: offer/answer/ice/chat
+ * Skip / Stop (reset) handling
+ * Robust cleanup on disconnect
  */
 
-const http = require("http");
-const url = require("url");
-const WebSocket = require("ws");
+import http from "http";
+import url from "url";
+import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = process.env.PORT || 10000;
 const WS_PATH = process.env.WS_PATH || "/ws";
 
 // --- Simple state ---
-/**
- * waitingQueue holds sockets waiting for a match
- * we keep it FIFO
- */
-const waitingQueue = [];
-
-/**
- * peerMap maps ws -> peer ws
- */
-const peerMap = new Map();
-
-/**
- * roleMap maps ws -> "caller" | "callee"
- */
-const roleMap = new Map();
+const waitingQueue = [];          // FIFO sockets waiting for match
+const peerMap = new Map();        // ws -> peer ws
+const roleMap = new Map();        // ws -> "caller" | "callee"
 
 function safeSend(ws, obj) {
   try {
@@ -50,11 +38,13 @@ function removeFromQueue(ws) {
 
 function unlinkPeers(ws, reason = "reset") {
   const peer = peerMap.get(ws);
+
   if (peer) {
     peerMap.delete(peer);
     roleMap.delete(peer);
     safeSend(peer, { type: reason });
   }
+
   peerMap.delete(ws);
   roleMap.delete(ws);
   safeSend(ws, { type: reason });
@@ -69,9 +59,8 @@ function enqueue(ws) {
 }
 
 function tryMatch() {
-  // pop dead sockets
+  // drop dead sockets from head
   while (waitingQueue.length && !isAlive(waitingQueue[0])) waitingQueue.shift();
-
   if (waitingQueue.length < 2) return;
 
   const a = waitingQueue.shift();
@@ -87,7 +76,7 @@ function tryMatch() {
   peerMap.set(a, b);
   peerMap.set(b, a);
 
-  // Deterministic roles: first becomes caller
+  // Deterministic roles: first is caller
   roleMap.set(a, "caller");
   roleMap.set(b, "callee");
 
@@ -108,7 +97,6 @@ function relay(ws, payload) {
 const server = http.createServer((req, res) => {
   const parsed = url.parse(req.url, true);
 
-  // Health endpoint
   if (parsed.pathname === "/" || parsed.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
@@ -126,7 +114,7 @@ const server = http.createServer((req, res) => {
   res.end("Not Found");
 });
 
-const wss = new WebSocket.Server({ noServer: true });
+const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
   const parsed = url.parse(req.url);
@@ -143,35 +131,30 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", (ws) => {
   safeSend(ws, { type: "hello", msg: "OMINGLE match server ready" });
 
-  // Put in queue immediately
   enqueue(ws);
 
   ws.on("message", (raw) => {
     let data;
     try {
       data = JSON.parse(raw.toString());
-    } catch (e) {
+    } catch (_) {
       return;
     }
 
-    // Client actions
     switch (data.type) {
       case "offer":
       case "answer":
       case "ice":
       case "chat":
-        // Only relay if matched
         relay(ws, data);
         break;
 
       case "skip":
-        // Skip current peer & immediately requeue skipper
         unlinkPeers(ws, "reset");
         enqueue(ws);
         break;
 
       case "stop":
-        // Stop ends the session; user goes back to queue (or you can keep idle)
         unlinkPeers(ws, "reset");
         enqueue(ws);
         break;
@@ -181,16 +164,13 @@ wss.on("connection", (ws) => {
         break;
 
       default:
-        // ignore unknown
         break;
     }
   });
 
   ws.on("close", () => {
-    // If in queue, remove
     removeFromQueue(ws);
 
-    // If paired, notify peer and requeue peer
     const peer = peerMap.get(ws);
     if (peer) {
       peerMap.delete(peer);
@@ -200,7 +180,6 @@ wss.on("connection", (ws) => {
       peerMap.delete(ws);
       roleMap.delete(ws);
 
-      // put peer back in queue
       if (isAlive(peer)) enqueue(peer);
     } else {
       peerMap.delete(ws);
@@ -209,7 +188,7 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("error", () => {
-    // handled by close cleanup
+    // cleanup happens in close
   });
 });
 
