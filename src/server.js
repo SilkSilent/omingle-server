@@ -1,12 +1,3 @@
-/**
- * OMINGLE Match + Signaling Server (MVP) - ESM
- * WebSocket path: /ws
- * Deterministic roles: caller/callee (only caller creates offer)
- * Relays: offer/answer/ice/chat
- * Skip / Stop (reset) handling
- * Robust cleanup on disconnect
- */
-
 import http from "http";
 import url from "url";
 import { WebSocketServer, WebSocket } from "ws";
@@ -14,102 +5,128 @@ import { WebSocketServer, WebSocket } from "ws";
 const PORT = process.env.PORT || 10000;
 const WS_PATH = process.env.WS_PATH || "/ws";
 
-// --- Simple state ---
-const waitingQueue = [];          // FIFO sockets waiting for match
-const peerMap = new Map();        // ws -> peer ws
-const roleMap = new Map();        // ws -> "caller" | "callee"
+// Queue + sessions
+const queue = [];
+const sessionOf = new Map(); // ws -> sessionId
+const peers = new Map();     // ws -> peer ws
+const ready = new Map();     // ws -> boolean (ready ack)
+let nextSessionId = 1;
 
 function safeSend(ws, obj) {
   try {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(obj));
-    }
-  } catch (_) {}
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  } catch {}
 }
-
-function isAlive(ws) {
+function alive(ws) {
   return ws && ws.readyState === WebSocket.OPEN;
 }
 
 function removeFromQueue(ws) {
-  const idx = waitingQueue.indexOf(ws);
-  if (idx !== -1) waitingQueue.splice(idx, 1);
+  const i = queue.indexOf(ws);
+  if (i !== -1) queue.splice(i, 1);
 }
 
-function unlinkPeers(ws, reason = "reset") {
-  const peer = peerMap.get(ws);
+function clearPair(ws, reason = "reset") {
+  const p = peers.get(ws);
 
-  if (peer) {
-    peerMap.delete(peer);
-    roleMap.delete(peer);
-    safeSend(peer, { type: reason });
+  if (p) {
+    peers.delete(p);
+    sessionOf.delete(p);
+    ready.delete(p);
+    safeSend(p, { type: "reset", reason });
   }
 
-  peerMap.delete(ws);
-  roleMap.delete(ws);
-  safeSend(ws, { type: reason });
+  peers.delete(ws);
+  sessionOf.delete(ws);
+  ready.delete(ws);
+  safeSend(ws, { type: "reset", reason });
 }
 
 function enqueue(ws) {
-  // avoid duplicates
+  if (!alive(ws)) return;
+
+  // If paired, do nothing
+  if (peers.get(ws)) return;
+
+  // Remove duplicates
   removeFromQueue(ws);
-  waitingQueue.push(ws);
+
+  queue.push(ws);
   safeSend(ws, { type: "searching" });
   tryMatch();
 }
 
 function tryMatch() {
-  // drop dead sockets from head
-  while (waitingQueue.length && !isAlive(waitingQueue[0])) waitingQueue.shift();
-  if (waitingQueue.length < 2) return;
+  // drop dead
+  while (queue.length && !alive(queue[0])) queue.shift();
+  if (queue.length < 2) return;
 
-  const a = waitingQueue.shift();
-  const b = waitingQueue.shift();
+  const a = queue.shift();
+  const b = queue.shift();
 
-  if (!isAlive(a) || !isAlive(b)) {
-    if (isAlive(a)) enqueue(a);
-    if (isAlive(b)) enqueue(b);
+  if (!alive(a) || !alive(b)) {
+    if (alive(a)) enqueue(a);
+    if (alive(b)) enqueue(b);
     return;
   }
 
-  // Pair them
-  peerMap.set(a, b);
-  peerMap.set(b, a);
+  const sessionId = String(nextSessionId++);
+  peers.set(a, b);
+  peers.set(b, a);
+  sessionOf.set(a, sessionId);
+  sessionOf.set(b, sessionId);
 
-  // Deterministic roles: first is caller
-  roleMap.set(a, "caller");
-  roleMap.set(b, "callee");
+  // reset readiness
+  ready.set(a, false);
+  ready.set(b, false);
 
-  safeSend(a, { type: "matched" });
-  safeSend(b, { type: "matched" });
+  // deterministic roles
+  safeSend(a, { type: "matched", sessionId });
+  safeSend(b, { type: "matched", sessionId });
+  safeSend(a, { type: "role", role: "caller", sessionId });
+  safeSend(b, { type: "role", role: "callee", sessionId });
 
-  safeSend(a, { type: "role", role: "caller" });
-  safeSend(b, { type: "role", role: "callee" });
+  // require both to ack ready; prevents "offer sent into void"
+  safeSend(a, { type: "need_ready", sessionId });
+  safeSend(b, { type: "need_ready", sessionId });
 }
 
-function relay(ws, payload) {
-  const peer = peerMap.get(ws);
-  if (!peer || !isAlive(peer)) return;
-  safeSend(peer, payload);
+function getPeer(ws) {
+  const p = peers.get(ws);
+  return alive(p) ? p : null;
 }
 
-// --- HTTP server (health + WS upgrade) ---
+function bothReady(ws) {
+  const p = getPeer(ws);
+  if (!p) return false;
+  return ready.get(ws) === true && ready.get(p) === true;
+}
+
+function relay(ws, msg) {
+  const p = getPeer(ws);
+  if (!p) return;
+
+  // Only relay signaling after both have ACKed ready
+  if (!bothReady(ws)) return;
+
+  safeSend(p, msg);
+}
+
 const server = http.createServer((req, res) => {
   const parsed = url.parse(req.url, true);
-
   if (parsed.pathname === "/" || parsed.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
         ok: true,
         wsPath: WS_PATH,
-        waiting: waitingQueue.length,
+        waiting: queue.length,
+        paired: peers.size / 2,
         uptime: process.uptime(),
       })
     );
     return;
   }
-
   res.writeHead(404);
   res.end("Not Found");
 });
@@ -118,78 +135,85 @@ const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
   const parsed = url.parse(req.url);
-  if (parsed.pathname !== WS_PATH) {
-    socket.destroy();
-    return;
-  }
-
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
+  if (parsed.pathname !== WS_PATH) return socket.destroy();
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws));
 });
 
 wss.on("connection", (ws) => {
-  safeSend(ws, { type: "hello", msg: "OMINGLE match server ready" });
+  safeSend(ws, { type: "hello" });
 
   enqueue(ws);
 
-  ws.on("message", (raw) => {
-    let data;
-    try {
-      data = JSON.parse(raw.toString());
-    } catch (_) {
+  ws.on("message", (buf) => {
+    let msg;
+    try { msg = JSON.parse(buf.toString()); } catch { return; }
+
+    // Always allow find/enqueue
+    if (msg.type === "find") {
+      // user wants to be matched (or rematched)
+      if (!peers.get(ws)) enqueue(ws);
       return;
     }
 
-    switch (data.type) {
-      case "offer":
-      case "answer":
-      case "ice":
-      case "chat":
-        relay(ws, data);
-        break;
+    // READY ACK: both must send this after receiving matched/role
+    if (msg.type === "ready") {
+      const sid = sessionOf.get(ws);
+      if (!sid) return; // not in a session
+      ready.set(ws, true);
 
-      case "skip":
-        unlinkPeers(ws, "reset");
-        enqueue(ws);
-        break;
+      const p = getPeer(ws);
+      if (p && ready.get(p) === true) {
+        // both ready -> tell both to start negotiation
+        safeSend(ws, { type: "go", sessionId: sid });
+        safeSend(p, { type: "go", sessionId: sid });
+      }
+      return;
+    }
 
-      case "stop":
-        unlinkPeers(ws, "reset");
-        enqueue(ws);
-        break;
+    // Skip/stop
+    if (msg.type === "skip") {
+      const p = getPeer(ws);
+      clearPair(ws, "skip");
+      if (alive(ws)) enqueue(ws);
+      if (alive(p)) enqueue(p);
+      return;
+    }
 
-      case "ping":
-        safeSend(ws, { type: "pong" });
-        break;
+    if (msg.type === "stop") {
+      clearPair(ws, "stop");
+      if (alive(ws)) enqueue(ws);
+      return;
+    }
 
-      default:
-        break;
+    // Relay signaling
+    if (msg.type === "desc" || msg.type === "ice" || msg.type === "chat") {
+      relay(ws, msg);
+      return;
     }
   });
 
   ws.on("close", () => {
     removeFromQueue(ws);
+    const p = peers.get(ws);
 
-    const peer = peerMap.get(ws);
-    if (peer) {
-      peerMap.delete(peer);
-      roleMap.delete(peer);
-      safeSend(peer, { type: "reset" });
+    if (p) {
+      peers.delete(p);
+      sessionOf.delete(p);
+      ready.delete(p);
+      safeSend(p, { type: "reset", reason: "disconnect" });
+      peers.delete(ws);
+      sessionOf.delete(ws);
+      ready.delete(ws);
 
-      peerMap.delete(ws);
-      roleMap.delete(ws);
-
-      if (isAlive(peer)) enqueue(peer);
+      if (alive(p)) enqueue(p);
     } else {
-      peerMap.delete(ws);
-      roleMap.delete(ws);
+      peers.delete(ws);
+      sessionOf.delete(ws);
+      ready.delete(ws);
     }
   });
 
-  ws.on("error", () => {
-    // cleanup happens in close
-  });
+  ws.on("error", () => {});
 });
 
 server.listen(PORT, "0.0.0.0", () => {
