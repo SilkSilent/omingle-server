@@ -1,139 +1,219 @@
-import http from "http";
-import express from "express";
-import { WebSocketServer } from "ws";
+/**
+ * OMINGLE Match + Signaling Server (MVP)
+ * - WebSocket path: /ws
+ * - Deterministic roles: caller/callee (only caller creates offer)
+ * - Relays: offer/answer/ice/chat
+ * - Skip / Stop (reset) handling
+ * - Robust cleanup on disconnect
+ */
+
+const http = require("http");
+const url = require("url");
+const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 10000;
 const WS_PATH = process.env.WS_PATH || "/ws";
 
-const app = express();
-app.get("/", (_req, res) => res.status(200).send("OMINGLE match server OK"));
-app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
-
-const server = http.createServer(app);
-
-const wss = new WebSocketServer({ server, path: WS_PATH });
+// --- Simple state ---
+/**
+ * waitingQueue holds sockets waiting for a match
+ * we keep it FIFO
+ */
+const waitingQueue = [];
 
 /**
- * Simple Omegle-like pairing:
- * - waiting: holds one socket waiting for a partner
- * - peerMap: maps socket -> partner socket
+ * peerMap maps ws -> peer ws
  */
-let waiting = null;
 const peerMap = new Map();
+
+/**
+ * roleMap maps ws -> "caller" | "callee"
+ */
+const roleMap = new Map();
 
 function safeSend(ws, obj) {
   try {
-    if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
   } catch (_) {}
 }
 
-function setPair(a, b) {
+function isAlive(ws) {
+  return ws && ws.readyState === WebSocket.OPEN;
+}
+
+function removeFromQueue(ws) {
+  const idx = waitingQueue.indexOf(ws);
+  if (idx !== -1) waitingQueue.splice(idx, 1);
+}
+
+function unlinkPeers(ws, reason = "reset") {
+  const peer = peerMap.get(ws);
+  if (peer) {
+    peerMap.delete(peer);
+    roleMap.delete(peer);
+    safeSend(peer, { type: reason });
+  }
+  peerMap.delete(ws);
+  roleMap.delete(ws);
+  safeSend(ws, { type: reason });
+}
+
+function enqueue(ws) {
+  // avoid duplicates
+  removeFromQueue(ws);
+  waitingQueue.push(ws);
+  safeSend(ws, { type: "searching" });
+  tryMatch();
+}
+
+function tryMatch() {
+  // pop dead sockets
+  while (waitingQueue.length && !isAlive(waitingQueue[0])) waitingQueue.shift();
+
+  if (waitingQueue.length < 2) return;
+
+  const a = waitingQueue.shift();
+  const b = waitingQueue.shift();
+
+  if (!isAlive(a) || !isAlive(b)) {
+    if (isAlive(a)) enqueue(a);
+    if (isAlive(b)) enqueue(b);
+    return;
+  }
+
+  // Pair them
   peerMap.set(a, b);
   peerMap.set(b, a);
 
-  // optional event (client can show "matched")
+  // Deterministic roles: first becomes caller
+  roleMap.set(a, "caller");
+  roleMap.set(b, "callee");
+
   safeSend(a, { type: "matched" });
   safeSend(b, { type: "matched" });
+
+  safeSend(a, { type: "role", role: "caller" });
+  safeSend(b, { type: "role", role: "callee" });
 }
 
-function getPeer(ws) {
-  return peerMap.get(ws) || null;
+function relay(ws, payload) {
+  const peer = peerMap.get(ws);
+  if (!peer || !isAlive(peer)) return;
+  safeSend(peer, payload);
 }
 
-function clearPair(ws, reason = "partner_left") {
-  const peer = getPeer(ws);
-  if (peer) {
-    peerMap.delete(peer);
-    safeSend(peer, { type: "reset", reason });
+// --- HTTP server (health + WS upgrade) ---
+const server = http.createServer((req, res) => {
+  const parsed = url.parse(req.url, true);
+
+  // Health endpoint
+  if (parsed.pathname === "/" || parsed.pathname === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        wsPath: WS_PATH,
+        waiting: waitingQueue.length,
+        uptime: process.uptime(),
+      })
+    );
+    return;
   }
-  peerMap.delete(ws);
-}
 
-function tryPutInWaiting(ws) {
-  // if someone is waiting, pair immediately
-  if (waiting && waiting !== ws && waiting.readyState === waiting.OPEN) {
-    const other = waiting;
-    waiting = null;
-    setPair(ws, other);
-    return true;
+  res.writeHead(404);
+  res.end("Not Found");
+});
+
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  const parsed = url.parse(req.url);
+  if (parsed.pathname !== WS_PATH) {
+    socket.destroy();
+    return;
   }
-  // else set as waiting
-  waiting = ws;
-  safeSend(ws, { type: "waiting" });
-  return false;
-}
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
+});
 
 wss.on("connection", (ws) => {
-  // When a client connects, put them in waiting pool
-  tryPutInWaiting(ws);
+  safeSend(ws, { type: "hello", msg: "OMINGLE match server ready" });
 
-  ws.on("message", (buf) => {
-    let msg;
+  // Put in queue immediately
+  enqueue(ws);
+
+  ws.on("message", (raw) => {
+    let data;
     try {
-      msg = JSON.parse(buf.toString());
-    } catch {
+      data = JSON.parse(raw.toString());
+    } catch (e) {
       return;
     }
 
-    const peer = getPeer(ws);
+    // Client actions
+    switch (data.type) {
+      case "offer":
+      case "answer":
+      case "ice":
+      case "chat":
+        // Only relay if matched
+        relay(ws, data);
+        break;
 
-    // If not paired yet, we only accept "offer" and use it to pair if needed.
-    // But we STILL need to forward it once paired.
-    if (!peer) {
-      if (msg.type === "offer") {
-        // If the sender is still waiting, try to pair now (race condition safe)
-        // If pairing happens, forward offer to peer.
-        const pairedNow = tryPutInWaiting(ws);
-        const newPeer = getPeer(ws);
+      case "skip":
+        // Skip current peer & immediately requeue skipper
+        unlinkPeers(ws, "reset");
+        enqueue(ws);
+        break;
 
-        if (pairedNow && newPeer) {
-          safeSend(newPeer, { type: "offer", offer: msg.offer });
-        }
-      }
-      return;
-    }
+      case "stop":
+        // Stop ends the session; user goes back to queue (or you can keep idle)
+        unlinkPeers(ws, "reset");
+        enqueue(ws);
+        break;
 
-    // If paired, relay signaling messages ONLY to partner
-    if (msg.type === "offer") {
-      safeSend(peer, { type: "offer", offer: msg.offer });
-      return;
-    }
-    if (msg.type === "answer") {
-      safeSend(peer, { type: "answer", answer: msg.answer });
-      return;
-    }
-    if (msg.type === "ice") {
-      safeSend(peer, { type: "ice", candidate: msg.candidate });
-      return;
-    }
-    if (msg.type === "skip") {
-      // both reset; re-queue both
-      safeSend(peer, { type: "reset", reason: "skip" });
-      clearPair(ws, "skip");
-      if (waiting === ws) waiting = null;
-      if (waiting === peer) waiting = null;
-      tryPutInWaiting(ws);
-      tryPutInWaiting(peer);
-      return;
+      case "ping":
+        safeSend(ws, { type: "pong" });
+        break;
+
+      default:
+        // ignore unknown
+        break;
     }
   });
 
   ws.on("close", () => {
-    // If this ws was waiting, clear waiting slot
-    if (waiting === ws) waiting = null;
+    // If in queue, remove
+    removeFromQueue(ws);
 
-    // Break pair and notify partner
-    clearPair(ws, "disconnect");
+    // If paired, notify peer and requeue peer
+    const peer = peerMap.get(ws);
+    if (peer) {
+      peerMap.delete(peer);
+      roleMap.delete(peer);
+      safeSend(peer, { type: "reset" });
+
+      peerMap.delete(ws);
+      roleMap.delete(ws);
+
+      // put peer back in queue
+      if (isAlive(peer)) enqueue(peer);
+    } else {
+      peerMap.delete(ws);
+      roleMap.delete(ws);
+    }
   });
 
   ws.on("error", () => {
-    // treat like close
-    if (waiting === ws) waiting = null;
-    clearPair(ws, "error");
+    // handled by close cleanup
   });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`OMINGLE match server listening on :${PORT}`);
   console.log(`WebSocket path: ${WS_PATH}`);
 });
