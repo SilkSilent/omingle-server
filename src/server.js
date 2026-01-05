@@ -3,15 +3,30 @@ import { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 10000;
 
-/** ====== Basic in-memory state (MVP) ====== */
-const clients = new Map(); // ws -> clientObj
+/** ====== State ====== */
+const clients = new Map(); // ws -> {id, ip, roomId, lastSeen, prefs, chatWindow, reportCount}
 const waitingFree = [];
-const waitingPref = []; // premium queue {ws, prefs, ts}
+const waitingPref = []; // {ws, prefs, ts}
 const rooms = new Map(); // roomId -> {a, b}
+
+// Bans: ip -> {until, reason}
+const bans = new Map();
+
+// Report strikes by ip (soft reputation)
+const strikes = new Map(); // ip -> {count, last}
+
+/** ====== Tunables ====== */
+const BAN_MS = 1000 * 60 * 60 * 6;          // 6h ban
+const STRIKE_DECAY_MS = 1000 * 60 * 60 * 24; // decay after 24h
+const STRIKE_THRESHOLD = 3;                  // 3 reports -> ban
+const CHAT_LIMIT = 8;                        // 8 msg per window
+const CHAT_WINDOW_MS = 5000;                 // 5 sec window
 
 function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
+
+function now() { return Date.now(); }
 
 function safeSend(ws, obj) {
   try {
@@ -19,22 +34,11 @@ function safeSend(ws, obj) {
   } catch {}
 }
 
-function now() {
-  return Date.now();
-}
-
-function getClient(ws) {
-  return clients.get(ws);
-}
+function getClient(ws) { return clients.get(ws); }
 
 function removeFromQueue(queue, ws) {
-  const i = queue.findIndex((x) => (x.ws ? x.ws === ws : x === ws));
+  const i = queue.findIndex((x) => (x?.ws ? x.ws === ws : x === ws));
   if (i >= 0) queue.splice(i, 1);
-}
-
-function inRoom(ws) {
-  const c = getClient(ws);
-  return c?.roomId || null;
 }
 
 function otherInRoom(roomId, ws) {
@@ -48,19 +52,41 @@ function endRoom(roomId, reason = "reset") {
   if (!r) return;
   rooms.delete(roomId);
 
-  [r.a, r.b].forEach((w) => {
+  for (const w of [r.a, r.b]) {
     const c = getClient(w);
     if (c) c.roomId = null;
     safeSend(w, { type: reason });
-  });
+  }
+}
+
+function isBanned(ip) {
+  const b = bans.get(ip);
+  if (!b) return null;
+  if (b.until <= now()) {
+    bans.delete(ip);
+    return null;
+  }
+  return b;
+}
+
+function banIp(ip, reason = "reports") {
+  bans.set(ip, { until: now() + BAN_MS, reason });
+}
+
+function addStrike(ip) {
+  const s = strikes.get(ip) || { count: 0, last: 0 };
+  // decay if old
+  if (s.last && (now() - s.last) > STRIKE_DECAY_MS) {
+    s.count = 0;
+  }
+  s.count += 1;
+  s.last = now();
+  strikes.set(ip, s);
+  return s.count;
 }
 
 function matchPrefsCompatible(p1, p2) {
-  // Prefs example: {gender:"female", country:"IT"}
   if (!p1 || !p2) return true;
-
-  // Simple compatibility rule:
-  // If both specify same key, it must match. If one specifies and other doesn't, allow.
   const keys = ["gender", "country"];
   for (const k of keys) {
     if (p1?.[k] && p2?.[k] && p1[k] !== p2[k]) return false;
@@ -69,7 +95,7 @@ function matchPrefsCompatible(p1, p2) {
 }
 
 function pickMatchFor(ws, prefs) {
-  // 1) Try pref queue first for best compatibility
+  // Try pref queue first
   for (let i = 0; i < waitingPref.length; i++) {
     const cand = waitingPref[i];
     if (!cand?.ws || cand.ws === ws) continue;
@@ -81,8 +107,8 @@ function pickMatchFor(ws, prefs) {
     }
   }
 
-  // 2) Otherwise use free queue
-  if (waitingFree.length > 0) {
+  // fallback free
+  while (waitingFree.length > 0) {
     const cand = waitingFree.shift();
     if (cand && clients.has(cand) && cand !== ws) return cand;
   }
@@ -92,7 +118,6 @@ function pickMatchFor(ws, prefs) {
 
 function createRoom(a, b) {
   const roomId = "room_" + uid();
-
   rooms.set(roomId, { a, b });
 
   const ca = getClient(a);
@@ -100,14 +125,30 @@ function createRoom(a, b) {
   if (ca) ca.roomId = roomId;
   if (cb) cb.roomId = roomId;
 
-  // deterministic roles: first is caller
+  // deterministic roles
   safeSend(a, { type: "matched", role: "caller" });
   safeSend(b, { type: "matched", role: "callee" });
 }
 
+function tooManyChat(ws) {
+  const c = getClient(ws);
+  if (!c) return true;
+
+  const t = now();
+  if (!c.chatWindow) c.chatWindow = { start: t, count: 0 };
+
+  // reset window
+  if (t - c.chatWindow.start > CHAT_WINDOW_MS) {
+    c.chatWindow.start = t;
+    c.chatWindow.count = 0;
+  }
+
+  c.chatWindow.count += 1;
+  return c.chatWindow.count > CHAT_LIMIT;
+}
+
 /** ====== Server ====== */
 const server = http.createServer((req, res) => {
-  // health
   if (req.url === "/" || req.url === "/health") {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
@@ -119,26 +160,34 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-wss.on("connection", (ws) => {
-  const id = uid();
+wss.on("connection", (ws, req) => {
+  const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "")
+    .toString()
+    .split(",")[0]
+    .trim();
 
+  const ban = isBanned(ip);
+  if (ban) {
+    safeSend(ws, { type: "banned", until: ban.until, reason: ban.reason });
+    try { ws.close(); } catch {}
+    return;
+  }
+
+  const id = uid();
   clients.set(ws, {
     id,
+    ip,
     roomId: null,
     lastSeen: now(),
     prefs: null,
-    muted: false,
+    chatWindow: null,
   });
 
   safeSend(ws, { type: "hello", id });
 
   ws.on("message", (raw) => {
     let data;
-    try {
-      data = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    try { data = JSON.parse(raw.toString()); } catch { return; }
 
     const c = getClient(ws);
     if (!c) return;
@@ -146,18 +195,22 @@ wss.on("connection", (ws) => {
 
     const t = data?.type;
 
-    // keepalive
     if (t === "ping") {
       safeSend(ws, { type: "pong" });
       return;
     }
 
-    // find a match
     if (t === "find") {
-      // if already in room, reset first
+      // banned mid-session?
+      const ban2 = isBanned(c.ip);
+      if (ban2) {
+        safeSend(ws, { type: "banned", until: ban2.until, reason: ban2.reason });
+        try { ws.close(); } catch {}
+        return;
+      }
+
       if (c.roomId) endRoom(c.roomId, "reset");
 
-      // clear any queue presence
       removeFromQueue(waitingFree, ws);
       removeFromQueue(waitingPref, ws);
 
@@ -165,10 +218,10 @@ wss.on("connection", (ws) => {
       c.prefs = prefs;
 
       const mate = pickMatchFor(ws, prefs);
+
       if (mate) {
         createRoom(ws, mate);
       } else {
-        // enqueue
         if (prefs) waitingPref.push({ ws, prefs, ts: now() });
         else waitingFree.push(ws);
         safeSend(ws, { type: "waiting" });
@@ -176,7 +229,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // stop: end current room + remove from queue
     if (t === "stop") {
       removeFromQueue(waitingFree, ws);
       removeFromQueue(waitingPref, ws);
@@ -185,10 +237,9 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // skip: end room then find again automatically (server-side)
     if (t === "skip") {
       if (c.roomId) endRoom(c.roomId, "reset");
-      // act like find with same prefs (if any)
+
       removeFromQueue(waitingFree, ws);
       removeFromQueue(waitingPref, ws);
 
@@ -205,22 +256,25 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // relay signaling only to the other user in the same room
+    // relay signaling
     if (["offer", "answer", "ice"].includes(t)) {
       const roomId = c.roomId;
       if (!roomId) return;
-
       const other = otherInRoom(roomId, ws);
       if (!other) return;
-
       safeSend(other, data);
       return;
     }
 
-    // chat relay
+    // chat relay (rate limited)
     if (t === "chat") {
       const roomId = c.roomId;
       if (!roomId) return;
+
+      if (tooManyChat(ws)) {
+        safeSend(ws, { type: "chat_limit" });
+        return;
+      }
 
       const other = otherInRoom(roomId, ws);
       if (!other) return;
@@ -232,11 +286,30 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // report (MVP): end match and put reporter back in queue
+    // report: strike other user ip; ban if threshold
     if (t === "report") {
       const roomId = c.roomId;
-      if (roomId) endRoom(roomId, "reset");
-      safeSend(ws, { type: "reported" });
+      if (!roomId) return;
+
+      const other = otherInRoom(roomId, ws);
+      if (!other) return;
+
+      const oc = getClient(other);
+      const otherIp = oc?.ip;
+
+      if (otherIp) {
+        const count = addStrike(otherIp);
+        if (count >= STRIKE_THRESHOLD) {
+          banIp(otherIp, "reports");
+          safeSend(other, { type: "banned", until: now() + BAN_MS, reason: "reports" });
+          try { other.close(); } catch {}
+        }
+      }
+
+      safeSend(ws, { type: "reported_ok" });
+
+      // end match for both
+      endRoom(roomId, "reset");
       return;
     }
   });
@@ -254,9 +327,9 @@ wss.on("connection", (ws) => {
   });
 });
 
-/** Cleanup dead clients (optional) */
+// cleanup inactive
 setInterval(() => {
-  const cutoff = now() - 1000 * 60 * 2; // 2 min
+  const cutoff = now() - 1000 * 60 * 2;
   for (const [ws, c] of clients.entries()) {
     if (c.lastSeen < cutoff) {
       try { ws.close(); } catch {}
@@ -265,6 +338,4 @@ setInterval(() => {
   }
 }, 30000);
 
-server.listen(PORT, () => {
-  console.log("OMINGLE server listening on", PORT);
-});
+server.listen(PORT, () => console.log("OMINGLE server listening on", PORT));
