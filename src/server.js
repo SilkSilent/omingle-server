@@ -1,607 +1,341 @@
-let ws = null;
-let pc = null;
-let localStream = null;
-let role = null;
+import http from "http";
+import { WebSocketServer } from "ws";
 
-let running = false;
-let connected = false;
-let pendingIce = [];
-let pingTimer = null;
+const PORT = process.env.PORT || 10000;
 
-let matchStartedAt = 0;
-let fallbackTimer = null;
+/** ====== State ====== */
+const clients = new Map(); // ws -> {id, ip, roomId, lastSeen, prefs, chatWindow, reportCount}
+const waitingFree = [];
+const waitingPref = []; // {ws, prefs, ts}
+const rooms = new Map(); // roomId -> {a, b}
 
-const $ = (id) => document.getElementById(id);
+// Bans: ip -> {until, reason}
+const bans = new Map();
 
-const localVideo   = $("localVideo");
-const remoteVideo  = $("remoteVideo");
-const btnStart     = $("btnStart");
-const btnSkip      = $("btnSkip");
-const btnMute      = $("btnMute");
-const btnReport    = $("btnReport");
+// Report strikes by ip (soft reputation)
+const strikes = new Map(); // ip -> {count, last}
 
-const chatLog      = $("chatLog");
-const chatInput    = $("chatInput");
-const btnSend      = $("btnSend");
+/** ====== Tunables ====== */
+const BAN_MS = 1000 * 60 * 60 * 6;          // 6h ban
+const STRIKE_DECAY_MS = 1000 * 60 * 60 * 24; // decay after 24h
+const STRIKE_THRESHOLD = 3;                  // 3 reports -> ban
+const CHAT_LIMIT = 8;                        // 8 msg per window
+const CHAT_WINDOW_MS = 5000;                 // 5 sec window
 
-const statusText   = $("statusText");
-const miniStatus   = $("miniStatus");
-const statusDot    = $("statusDot");
-const countdownEl  = $("countdown");
-const remoteLabel  = $("remoteLabel");
-
-const prefGender   = $("prefGender");
-const prefCountry  = $("prefCountry");
-const premiumHint  = $("premiumHint");
-
-const btnDebugToggle = $("btnDebugToggle");
-const debugPanel     = $("debugPanel");
-const debugOut       = $("debugOut");
-const btnDebugCopy   = $("btnDebugCopy");
-
-/* ===== Premium from WP ===== */
-const U = window.OMINGLE_USER || { logged:false, memberId:"", plan:"", status:"" };
-const isPremiumActive =
-  U.logged && (U.plan === "plus" || U.plan === "elite") && U.status === "active";
-
-/* ===== UI ===== */
-function log(msg){
-  if (!chatLog) return;
-  chatLog.textContent = (chatLog.textContent ? chatLog.textContent : "") + "\n" + msg;
-  chatLog.scrollTop = chatLog.scrollHeight;
-}
-function clearLog(){
-  if (chatLog) chatLog.textContent = "";
-}
-function setStatus(t){
-  if (statusText) statusText.textContent = t;
-  if (miniStatus) miniStatus.textContent = t;
-}
-function setDot(mode){
-  if (!statusDot) return;
-  if (mode === "ready") statusDot.style.background = "#6fdc8c";
-  if (mode === "search") statusDot.style.background = "#f4c430";
-  if (mode === "connected") statusDot.style.background = "#2d7dff";
-  if (mode === "off") statusDot.style.background = "#b7c6d6";
-}
-function showLabel(t){
-  if (!remoteLabel) return;
-  remoteLabel.textContent = t;
-  remoteLabel.style.display = "block";
-}
-function hideLabel(){
-  if (!remoteLabel) return;
-  remoteLabel.style.display = "none";
-}
-function setButtonMode(){
-  if (!btnStart) return;
-  btnStart.textContent = running ? "Stop" : "Avvia";
+function uid() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-/* ===== Premium UI ===== */
-function initPremiumUI(){
-  if (!prefGender || !prefCountry || !premiumHint) return;
+function now() { return Date.now(); }
 
-  if (!isPremiumActive) {
-    prefGender.disabled = true;
-    prefCountry.disabled = true;
-
-    if (!U.logged) {
-      premiumHint.textContent = "🔒 Loggati per usare i filtri Premium";
-    } else {
-      premiumHint.textContent = "🔒 Premium non attivo (" + (U.status || "—") + ")";
-    }
-  } else {
-    premiumHint.textContent = "💎 Premium attivo (" + U.plan + " • " + (U.memberId || "ID") + ")";
-  }
-}
-function getPrefs(){
-  if (!isPremiumActive) return null;
-  const gender = (prefGender?.value || "").trim();
-  const country = (prefCountry?.value || "").trim();
-  const prefs = {};
-  if (gender) prefs.gender = gender;
-  if (country) prefs.country = country;
-  return Object.keys(prefs).length ? prefs : null;
-}
-
-/* ===== Debug ===== */
-function dbgLine(k, v){
-  return `${k}: ${v}\n`;
-}
-function wsStateName(){
-  if (!ws) return "null";
-  const s = ws.readyState;
-  return s === 0 ? "CONNECTING" : s === 1 ? "OPEN" : s === 2 ? "CLOSING" : "CLOSED";
-}
-function updateDebug(){
-  if (!debugOut) return;
-
-  const wsState = wsStateName();
-  const pcState = pc?.connectionState || "null";
-  const iceState = pc?.iceConnectionState || "null";
-  const sigState = pc?.signalingState || "null";
-  const remoteHasStream = !!remoteVideo?.srcObject;
-
-  const sinceMatch = matchStartedAt ? `${Math.floor((Date.now() - matchStartedAt)/1000)}s` : "-";
-
-  let out = "";
-  out += dbgLine("running", running);
-  out += dbgLine("connected", connected);
-  out += dbgLine("role", role || "-");
-  out += dbgLine("WS", wsState);
-  out += dbgLine("PC.connectionState", pcState);
-  out += dbgLine("PC.iceConnectionState", iceState);
-  out += dbgLine("PC.signalingState", sigState);
-  out += dbgLine("remoteStream", remoteHasStream ? "yes" : "no");
-  out += dbgLine("pendingIce", pendingIce.length);
-  out += dbgLine("sinceMatch", sinceMatch);
-  out += dbgLine("premiumActive", isPremiumActive);
-  out += dbgLine("prefs", JSON.stringify(getPrefs()));
-  debugOut.textContent = out;
-}
-
-btnDebugToggle?.addEventListener("click", () => {
-  if (!debugPanel) return;
-  debugPanel.style.display = (debugPanel.style.display === "none" || !debugPanel.style.display) ? "block" : "none";
-  updateDebug();
-});
-
-btnDebugCopy?.addEventListener("click", async () => {
+function safeSend(ws, obj) {
   try {
-    await navigator.clipboard.writeText(debugOut?.textContent || "");
-    log("✅ Debug copiato negli appunti");
-  } catch {
-    log("⚠️ Impossibile copiare debug (permessi browser)");
-  }
-});
-
-setInterval(updateDebug, 1000);
-
-/* ===== Media ===== */
-async function getLocalStream(){
-  if (localStream) return localStream;
-
-  localStream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "user" },
-    audio: true,
-  });
-
-  localVideo.srcObject = localStream;
-  localVideo.muted = true;
-  localVideo.playsInline = true;
-  localVideo.autoplay = true;
-  await localVideo.play().catch(()=>{});
-  return localStream;
-}
-
-/* ===== WebRTC ===== */
-function stopFallbackTimer(){
-  if (fallbackTimer) clearTimeout(fallbackTimer);
-  fallbackTimer = null;
-}
-
-function startFallbackTimer(){
-  stopFallbackTimer();
-
-  // Dopo 10s: se non arriva remote stream -> fallback chat-only + suggerimento skip
-  fallbackTimer = setTimeout(() => {
-    if (!running) return;
-    if (connected) return;
-    const hasRemote = !!remoteVideo?.srcObject;
-
-    if (!hasRemote) {
-      log("⚠️ La tua rete sembra limitare la video-connessione. Passiamo in modalità chat-only.");
-      setStatus("Chat-only");
-      setDot("search");
-      showLabel("Rete limitata: chat-only. Prova Skip o cambia rete.");
-    }
-  }, 10000);
-}
-
-function closePeer(){
-  stopFallbackTimer();
-  pendingIce = [];
-  connected = false;
-
-  try {
-    if (pc) {
-      pc.onicecandidate = null;
-      pc.ontrack = null;
-      pc.onconnectionstatechange = null;
-      pc.close();
-    }
-  } catch {}
-  pc = null;
-
-  try { remoteVideo.srcObject = null; } catch {}
-}
-
-function createPeer(){
-  closePeer();
-  pendingIce = [];
-
-  pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: "stun:stun.l.google.com:19302" },
-      { urls: "stun:stun1.l.google.com:19302" },
-      { urls: "stun:stun2.l.google.com:19302" },
-    ],
-  });
-
-  pc.onicecandidate = (e) => {
-    if (e.candidate && ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type:"ice", candidate:e.candidate }));
-    }
-  };
-
-  pc.ontrack = (e) => {
-    remoteVideo.srcObject = e.streams[0];
-    remoteVideo.playsInline = true;
-    remoteVideo.autoplay = true;
-    remoteVideo.play().catch(()=>{});
-    hideLabel();
-  };
-
-  pc.onconnectionstatechange = () => {
-    const st = pc.connectionState;
-    if (st === "connected") {
-      connected = true;
-      stopFallbackTimer();
-      setStatus("Connesso");
-      setDot("connected");
-    }
-    if (st === "disconnected" || st === "failed" || st === "closed") {
-      connected = false;
-    }
-  };
-}
-
-async function startCall(){
-  await getLocalStream();
-  createPeer();
-
-  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-  startFallbackTimer();
-
-  if (role === "caller"){
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    ws?.send(JSON.stringify({ type:"offer", offer }));
-  }
-}
-
-async function acceptOffer(offer){
-  await getLocalStream();
-  createPeer();
-
-  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-  await pc.setRemoteDescription(offer);
-
-  for (const c of pendingIce) {
-    try { await pc.addIceCandidate(c); } catch {}
-  }
-  pendingIce = [];
-
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-  ws?.send(JSON.stringify({ type:"answer", answer }));
-}
-
-async function acceptAnswer(answer){
-  if (!pc) return;
-  await pc.setRemoteDescription(answer);
-
-  for (const c of pendingIce) {
-    try { await pc.addIceCandidate(c); } catch {}
-  }
-  pendingIce = [];
-}
-
-async function acceptIce(candidate){
-  if (!pc) return;
-
-  if (!pc.remoteDescription) {
-    pendingIce.push(candidate);
-    return;
-  }
-  try { await pc.addIceCandidate(candidate); } catch {}
-}
-
-/* ===== Chat (client rate-limit soft) ===== */
-let chatBurst = { start: 0, count: 0 };
-function chatTooFast(){
-  const t = Date.now();
-  if (!chatBurst.start || (t - chatBurst.start) > 4000) {
-    chatBurst = { start: t, count: 0 };
-  }
-  chatBurst.count += 1;
-  return chatBurst.count > 6;
-}
-
-function canChat(){
-  return running && ws?.readyState === WebSocket.OPEN;
-}
-
-function sendChat(){
-  const text = (chatInput?.value || "").trim();
-  if (!text) return;
-
-  if (!canChat()) {
-    log("ℹ️ Non sei connesso al server.");
-    return;
-  }
-
-  if (chatTooFast()) {
-    log("⚠️ Troppi messaggi: rallenta un attimo.");
-    return;
-  }
-
-  ws.send(JSON.stringify({ type:"chat", text }));
-  log("🧑 Tu: " + text);
-  chatInput.value = "";
-}
-
-btnSend?.addEventListener("click", sendChat);
-chatInput?.addEventListener("keydown", e => { if (e.key === "Enter") sendChat(); });
-
-/* ===== Countdown ===== */
-function countdown(cb){
-  if (!countdownEl) return cb();
-
-  let n = 3;
-  countdownEl.textContent = n;
-
-  const i = setInterval(()=>{
-    n--;
-    countdownEl.textContent = n > 0 ? n : "";
-    if (n === 0){
-      clearInterval(i);
-      cb();
-    }
-  }, 1000);
-}
-
-/* ===== WS helpers ===== */
-function wsSend(obj){
-  try {
-    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+    if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
   } catch {}
 }
 
-function stopPing(){
-  if (pingTimer) clearInterval(pingTimer);
-  pingTimer = null;
+function getClient(ws) { return clients.get(ws); }
+
+function removeFromQueue(queue, ws) {
+  const i = queue.findIndex((x) => (x?.ws ? x.ws === ws : x === ws));
+  if (i >= 0) queue.splice(i, 1);
 }
 
-function startPing(){
-  stopPing();
-  pingTimer = setInterval(() => {
-    if (ws?.readyState === WebSocket.OPEN) wsSend({ type:"ping" });
-  }, 20000);
+function otherInRoom(roomId, ws) {
+  const r = rooms.get(roomId);
+  if (!r) return null;
+  return r.a === ws ? r.b : r.a;
 }
 
-/* ===== Match flow ===== */
-function findMatch(){
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+function endRoom(roomId, reason = "reset") {
+  const r = rooms.get(roomId);
+  if (!r) return;
+  rooms.delete(roomId);
 
-  setStatus("Cercando…");
-  setDot("search");
-  showLabel("Cerchiamo un utente…");
-
-  wsSend({ type:"find", prefs: getPrefs() });
+  for (const w of [r.a, r.b]) {
+    const c = getClient(w);
+    if (c) c.roomId = null;
+    safeSend(w, { type: reason });
+  }
 }
 
-function softResetUI(){
-  closePeer();
-  setDot(running ? "search" : "ready");
-  showLabel("In attesa di un utente…");
+function isBanned(ip) {
+  const b = bans.get(ip);
+  if (!b) return null;
+  if (b.until <= now()) {
+    bans.delete(ip);
+    return null;
+  }
+  return b;
 }
 
-/* ===== Connect / Disconnect ===== */
-function connectWS(){
-  return new Promise((resolve, reject) => {
-    const url = window.OMINGLE_WS_URL;
-    if (!url) return reject(new Error("OMINGLE_WS_URL missing"));
+function banIp(ip, reason = "reports") {
+  bans.set(ip, { until: now() + BAN_MS, reason });
+}
 
-    ws = new WebSocket(url);
+function addStrike(ip) {
+  const s = strikes.get(ip) || { count: 0, last: 0 };
+  // decay if old
+  if (s.last && (now() - s.last) > STRIKE_DECAY_MS) {
+    s.count = 0;
+  }
+  s.count += 1;
+  s.last = now();
+  strikes.set(ip, s);
+  return s.count;
+}
 
-    ws.onopen = () => {
-      startPing();
-      resolve();
-    };
+function matchPrefsCompatible(p1, p2) {
+  if (!p1 || !p2) return true;
+  const keys = ["gender", "country"];
+  for (const k of keys) {
+    if (p1?.[k] && p2?.[k] && p1[k] !== p2[k]) return false;
+  }
+  return true;
+}
 
-    ws.onerror = (e) => {
-      stopPing();
-      reject(e);
-    };
+function pickMatchFor(ws, prefs) {
+  // Try pref queue first
+  for (let i = 0; i < waitingPref.length; i++) {
+    const cand = waitingPref[i];
+    if (!cand?.ws || cand.ws === ws) continue;
+    if (!clients.has(cand.ws)) continue;
 
-    ws.onclose = () => {
-      stopPing();
-      if (running) {
-        log("🔌 Server disconnesso");
-        setStatus("Offline");
-        setDot("off");
-        showLabel("Server offline. Riprova.");
-      }
-    };
+    if (matchPrefsCompatible(prefs, cand.prefs)) {
+      waitingPref.splice(i, 1);
+      return cand.ws;
+    }
+  }
 
-    ws.onmessage = async (msg) => {
-      let data;
-      try { data = JSON.parse(msg.data); } catch { return; }
+  // fallback free
+  while (waitingFree.length > 0) {
+    const cand = waitingFree.shift();
+    if (cand && clients.has(cand) && cand !== ws) return cand;
+  }
 
-      if (data.type === "banned") {
-        const until = data.until ? new Date(data.until) : null;
-        log("⛔ Sei stato bannato" + (until ? (" fino a " + until.toLocaleString()) : ""));
-        setStatus("Bannato");
-        setDot("off");
-        showLabel("Bannato. Torna più tardi.");
-        stopSession(false);
-        return;
-      }
+  return null;
+}
 
-      if (data.type === "waiting") {
-        log("⌛ In attesa…");
-        setStatus("In attesa…");
-        setDot("search");
-        showLabel("In attesa di un utente…");
-        return;
-      }
+function createRoom(a, b) {
+  const roomId = "room_" + uid();
+  rooms.set(roomId, { a, b });
 
-      if (data.type === "matched") {
-        role = data.role;
-        matchStartedAt = Date.now();
-        log("✅ Utente trovato");
-        setStatus("Connessione…");
-        setDot("search");
-        hideLabel();
+  const ca = getClient(a);
+  const cb = getClient(b);
+  if (ca) ca.roomId = roomId;
+  if (cb) cb.roomId = roomId;
 
-        countdown(() => startCall());
-        return;
-      }
+  // deterministic roles
+  safeSend(a, { type: "matched", role: "caller" });
+  safeSend(b, { type: "matched", role: "callee" });
+}
 
-      if (data.type === "offer") {
-        log("📩 Offer");
-        await acceptOffer(data.offer);
-        return;
-      }
+function tooManyChat(ws) {
+  const c = getClient(ws);
+  if (!c) return true;
 
-      if (data.type === "answer") {
-        log("📩 Answer");
-        await acceptAnswer(data.answer);
-        return;
-      }
+  const t = now();
+  if (!c.chatWindow) c.chatWindow = { start: t, count: 0 };
 
-      if (data.type === "ice" && data.candidate) {
-        await acceptIce(data.candidate);
-        return;
-      }
+  // reset window
+  if (t - c.chatWindow.start > CHAT_WINDOW_MS) {
+    c.chatWindow.start = t;
+    c.chatWindow.count = 0;
+  }
 
-      if (data.type === "chat") {
-        log("👤 Stranger: " + (data.text || ""));
-        return;
-      }
+  c.chatWindow.count += 1;
+  return c.chatWindow.count > CHAT_LIMIT;
+}
 
-      if (data.type === "chat_limit") {
-        log("⚠️ Limite chat: rallenta un attimo.");
-        return;
-      }
+/** ====== Server ====== */
+const server = http.createServer((req, res) => {
+  if (req.url === "/" || req.url === "/health") {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("ok");
+    return;
+  }
+  res.writeHead(404);
+  res.end("not found");
+});
 
-      if (data.type === "reported_ok") {
-        log("✅ Segnalazione registrata.");
-        return;
-      }
+const wss = new WebSocketServer({ server, path: "/ws" });
 
-      if (data.type === "reset") {
-        log("🔄 Match terminato");
-        softResetUI();
-        if (running) findMatch();
-        return;
-      }
+wss.on("connection", (ws, req) => {
+  const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "")
+    .toString()
+    .split(",")[0]
+    .trim();
 
-      if (data.type === "pong") return;
-    };
+  const ban = isBanned(ip);
+  if (ban) {
+    safeSend(ws, { type: "banned", until: ban.until, reason: ban.reason });
+    try { ws.close(); } catch {}
+    return;
+  }
+
+  const id = uid();
+  clients.set(ws, {
+    id,
+    ip,
+    roomId: null,
+    lastSeen: now(),
+    prefs: null,
+    chatWindow: null,
   });
-}
 
-/* ===== Start/Stop session ===== */
-async function startSession(){
-  try {
-    running = true;
-    setButtonMode();
-    clearLog();
+  safeSend(ws, { type: "hello", id });
 
-    setStatus("Avvio…");
-    setDot("search");
-    showLabel("Cerchiamo un utente…");
+  ws.on("message", (raw) => {
+    let data;
+    try { data = JSON.parse(raw.toString()); } catch { return; }
 
-    if (isPremiumActive) {
-      log("💎 Premium attivo (" + U.plan + ") — " + (U.memberId || "ID"));
-    } else if (U.logged && U.status && U.status !== "active") {
-      log("ℹ️ Premium: " + U.status + " (filtri disattivati finché non è active)");
-    } else {
-      log("🙂 Free mode");
+    const c = getClient(ws);
+    if (!c) return;
+    c.lastSeen = now();
+
+    const t = data?.type;
+
+    if (t === "ping") {
+      safeSend(ws, { type: "pong" });
+      return;
     }
 
-    await getLocalStream();
+    if (t === "find") {
+      // banned mid-session?
+      const ban2 = isBanned(c.ip);
+      if (ban2) {
+        safeSend(ws, { type: "banned", until: ban2.until, reason: ban2.reason });
+        try { ws.close(); } catch {}
+        return;
+      }
 
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      await connectWS();
+      if (c.roomId) endRoom(c.roomId, "reset");
+
+      removeFromQueue(waitingFree, ws);
+      removeFromQueue(waitingPref, ws);
+
+      const prefs = data?.prefs || null;
+      c.prefs = prefs;
+
+      const mate = pickMatchFor(ws, prefs);
+
+      if (mate) {
+        createRoom(ws, mate);
+      } else {
+        if (prefs) waitingPref.push({ ws, prefs, ts: now() });
+        else waitingFree.push(ws);
+        safeSend(ws, { type: "waiting" });
+      }
+      return;
     }
 
-    findMatch();
-  } catch (e) {
-    log("❌ Errore avvio: " + (e?.message || e));
-    running = false;
-    setButtonMode();
-    setStatus("Pronto");
-    setDot("ready");
-    showLabel("In attesa di un utente…");
+    if (t === "stop") {
+      removeFromQueue(waitingFree, ws);
+      removeFromQueue(waitingPref, ws);
+      if (c.roomId) endRoom(c.roomId, "reset");
+      safeSend(ws, { type: "stopped" });
+      return;
+    }
+
+    if (t === "skip") {
+      if (c.roomId) endRoom(c.roomId, "reset");
+
+      removeFromQueue(waitingFree, ws);
+      removeFromQueue(waitingPref, ws);
+
+      const prefs = data?.prefs || c.prefs || null;
+      c.prefs = prefs;
+
+      const mate = pickMatchFor(ws, prefs);
+      if (mate) createRoom(ws, mate);
+      else {
+        if (prefs) waitingPref.push({ ws, prefs, ts: now() });
+        else waitingFree.push(ws);
+        safeSend(ws, { type: "waiting" });
+      }
+      return;
+    }
+
+    // relay signaling
+    if (["offer", "answer", "ice"].includes(t)) {
+      const roomId = c.roomId;
+      if (!roomId) return;
+      const other = otherInRoom(roomId, ws);
+      if (!other) return;
+      safeSend(other, data);
+      return;
+    }
+
+    // chat relay (rate limited)
+    if (t === "chat") {
+      const roomId = c.roomId;
+      if (!roomId) return;
+
+      if (tooManyChat(ws)) {
+        safeSend(ws, { type: "chat_limit" });
+        return;
+      }
+
+      const other = otherInRoom(roomId, ws);
+      if (!other) return;
+
+      const text = (data?.text || "").toString().slice(0, 800);
+      if (!text.trim()) return;
+
+      safeSend(other, { type: "chat", text });
+      return;
+    }
+
+    // report: strike other user ip; ban if threshold
+    if (t === "report") {
+      const roomId = c.roomId;
+      if (!roomId) return;
+
+      const other = otherInRoom(roomId, ws);
+      if (!other) return;
+
+      const oc = getClient(other);
+      const otherIp = oc?.ip;
+
+      if (otherIp) {
+        const count = addStrike(otherIp);
+        if (count >= STRIKE_THRESHOLD) {
+          banIp(otherIp, "reports");
+          safeSend(other, { type: "banned", until: now() + BAN_MS, reason: "reports" });
+          try { other.close(); } catch {}
+        }
+      }
+
+      safeSend(ws, { type: "reported_ok" });
+
+      // end match for both
+      endRoom(roomId, "reset");
+      return;
+    }
+  });
+
+  ws.on("close", () => {
+    const c = getClient(ws);
+    if (!c) return;
+
+    removeFromQueue(waitingFree, ws);
+    removeFromQueue(waitingPref, ws);
+
+    if (c.roomId) endRoom(c.roomId, "reset");
+
+    clients.delete(ws);
+  });
+});
+
+// cleanup inactive
+setInterval(() => {
+  const cutoff = now() - 1000 * 60 * 2;
+  for (const [ws, c] of clients.entries()) {
+    if (c.lastSeen < cutoff) {
+      try { ws.close(); } catch {}
+      clients.delete(ws);
+    }
   }
-}
+}, 30000);
 
-function stopSession(closeWs = true){
-  running = false;
-  setButtonMode();
-
-  closePeer();
-  connected = false;
-  matchStartedAt = 0;
-
-  if (closeWs) {
-    try { wsSend({ type:"stop" }); } catch {}
-    try { ws?.close(); } catch {}
-    ws = null;
-  }
-
-  setStatus("Pronto");
-  setDot("ready");
-  showLabel("In attesa di un utente…");
-}
-
-/* ===== Buttons ===== */
-btnStart?.addEventListener("click", () => {
-  if (running) stopSession(true);
-  else startSession();
-});
-
-btnSkip?.addEventListener("click", () => {
-  if (!running) return;
-  log("⏭️ Skip…");
-  closePeer();
-  connected = false;
-  setStatus("Cercando…");
-  setDot("search");
-  showLabel("Cerchiamo un utente…");
-  wsSend({ type:"skip", prefs: getPrefs() });
-});
-
-btnMute?.addEventListener("click", async () => {
-  const s = await getLocalStream();
-  const a = s.getAudioTracks()?.[0];
-  if (!a) return;
-  a.enabled = !a.enabled;
-  log(a.enabled ? "🎤 Unmuted" : "🔇 Muted");
-});
-
-btnReport?.addEventListener("click", () => {
-  if (!running) return;
-  log("🚨 Segnalazione inviata. Cerchiamo un altro utente…");
-  closePeer();
-  connected = false;
-  setStatus("Cercando…");
-  setDot("search");
-  showLabel("Cerchiamo un utente…");
-  wsSend({ type:"report" });
-  setTimeout(() => { if (running) findMatch(); }, 250);
-});
-
-/* ===== Init ===== */
-initPremiumUI();
-setStatus("Pronto");
-setDot("ready");
-showLabel("In attesa di un utente…");
-setButtonMode();
-updateDebug();
+server.listen(PORT, () => console.log("OMINGLE server listening on", PORT));
